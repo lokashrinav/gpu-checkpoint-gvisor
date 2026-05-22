@@ -1,151 +1,105 @@
-# Multi-GPU Checkpoint/Restore for gVisor
+# GPU Checkpoint/Restore for gVisor
+
+Freeze a running GPU container, save it to disk, and restore it on a different machine — with all GPU memory intact. Handles single-GPU and multi-GPU containers, including containers with active inter-GPU communication (NCCL).
+
+## Why This Exists
+
+GPU containers take minutes to start. A typical inference server needs to load model weights into GPU memory, build CUDA graphs, warm up the inference engine. If you could snapshot a fully initialized container and restore it later, startup drops from minutes to seconds.
+
+[gVisor](https://github.com/google/gvisor) is a container runtime that can already checkpoint and restore CPU containers. But GPU containers crash on checkpoint — every GPU-related save/restore method was `panic("not implemented")`. This project replaces those panics with working checkpoint/restore.
 
 ## Background
 
-gVisor is a container runtime that runs a user-space kernel (called the "sentry") between your application and the host OS. Instead of your container talking directly to the Linux kernel, it talks to gVisor's sentry, which intercepts every system call. This gives you strong isolation — the container never touches the real kernel.
+To understand the problem, you need to know how GPU access works inside gVisor.
 
-GPU access works through a component called **nvproxy**. When an application inside a gVisor container opens a GPU device (like `/dev/nvidia0`), nvproxy intercepts the request and opens the *real* device on the host on the container's behalf. Every GPU operation — memory allocation, kernel launches, CUDA context creation — goes through nvproxy as a proxy layer. The application thinks it's talking to a GPU directly, but nvproxy is mediating every interaction.
+**How a normal program talks to a GPU:** A program uses CUDA to interact with the GPU. Under the hood, CUDA opens device files (`/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-uvm`) and sends commands to the NVIDIA kernel driver through `ioctl` system calls. The kernel driver talks to the GPU hardware. The program never touches the GPU directly — everything goes through file descriptors and ioctls.
 
-**Checkpoint/restore** means saving a running container's entire state to disk and later resuming it, possibly on a different machine. This is how platforms like Modal offer instant cold starts — instead of booting a container from scratch and reloading a model (which can take 60+ seconds), they restore from a snapshot in under a second.
+**How gVisor changes this:** gVisor sandboxes containers by intercepting all system calls. The container doesn't talk to the real Linux kernel — it talks to gVisor's userspace kernel (the "sentry"). For GPU access, a component called **nvproxy** intercepts GPU-related ioctls from the container and forwards them to the real NVIDIA driver on the host. The container thinks it's talking directly to the GPU, but every command is proxied.
 
-## The Problem
+**Why checkpoint is hard:** When you checkpoint a container, gVisor serializes the sentry's state to disk — process memory, file descriptors, kernel objects. But GPU state spans multiple layers that the sentry doesn't fully control:
 
-### Problem 1: gVisor crashes on GPU checkpoint
+1. **Host file descriptors.** nvproxy holds open file descriptors to the real `/dev/nvidia0` on the host. These are handles managed by the host Linux kernel. After checkpoint, those handles are gone — they existed in the old host kernel's memory and were cleaned up when the container stopped.
 
-gVisor has no support for checkpointing containers that use GPUs. Every checkpoint-related method in nvproxy is implemented as `panic("not implemented")` — meaning if you try to save a GPU container, gVisor crashes immediately.
+2. **GPU memory mappings.** GPU device memory is mapped into the container's address space through special memory regions. gVisor's serializer doesn't know how to save GPU-backed memory — it only handles regular RAM.
 
-The reason this is hard: when your application opens `/dev/nvidia0`, nvproxy opens the real `/dev/nvidia0` on the host and holds that file descriptor internally. When gVisor's serializer tries to save the container state, it encounters this host file descriptor and doesn't know what to do with it. The file descriptor number (say, FD 47) is just a number that refers to an open file on *this specific host*. It's meaningless on a different machine. The same problem applies to memory-mapped GPU regions and event notification handles — they're all tied to the physical hardware on the current host.
+3. **GPU-side state.** The actual contents of GPU memory (model weights, CUDA contexts, execution state) live on the GPU hardware. The sentry can't reach into the GPU and pull this out.
 
-On top of that, two internal data structures are missing the annotations that tell gVisor's serializer how to handle them, so the serializer hits nil pointer errors before it even gets to the file descriptor problems.
+## How It Works
 
-### Problem 2: Multi-GPU deadlocks
+### Saving a Checkpoint
 
-Even if you fix the serialization crash, containers with multiple GPUs introduce a coordination problem.
+**Step 1: Freeze GPU state.** gVisor invokes a helper binary (`gvisor-gpu-ckpt`) inside the container. This binary calls NVIDIA's `cuCheckpointProcessLock` followed by `cuCheckpointProcessCheckpoint`, which tells the NVIDIA driver to snapshot all GPU state (memory contents, CUDA contexts, streams) into host memory where gVisor can serialize it.
 
-When a container uses multiple GPUs for training or inference, the GPUs communicate with each other through NCCL (NVIDIA's multi-GPU communication library). NCCL sets up peer-to-peer channels between GPUs — GPU 0 sends data to GPU 1, GPU 1 sends to GPU 2, and so on. These transfers happen continuously during operation.
+**Step 2: Drop GPU memory mappings.** gVisor walks the container's memory map and removes any memory regions backed by GPU device memory. These regions can't be serialized, but they don't need to be — the GPU memory contents were already captured in step 1, and the mappings themselves can be rebuilt after restore.
 
-To checkpoint a GPU, you first have to lock it — freeze all its active work so the state is consistent. If you try to lock GPUs one at a time, you deadlock. Here's why: you lock GPU 0, but GPU 1 is in the middle of receiving a transfer from GPU 0. GPU 1 can't be locked until that transfer completes. But the transfer can't complete because GPU 0 is already frozen. Neither GPU can make progress. With 8 GPUs all communicating with each other, this deadlock is almost guaranteed.
+**Step 3: Serialize everything else.** gVisor's serialization framework (stateify) writes the rest of the sentry's state to disk: process memory, file descriptor tables, nvproxy's internal bookkeeping, and the GPU state snapshot from step 1.
 
-The only way to avoid this is to lock **all GPUs at the same instant**, before any of them start checkpointing. But atomically locking 8 independent GPUs without hitting the same deadlock seems like a chicken-and-egg problem.
+### Restoring from a Checkpoint
 
-## The Solution
+**Step 1: Deserialize sentry state.** gVisor reads the checkpoint file and rebuilds the sentry's in-memory state. At this point, the file descriptor table says "fd 3 was /dev/nvidia0" — but there's no actual connection to any GPU. The old host's kernel objects are gone.
 
-It turns out gVisor's architecture makes this solvable. In gVisor, there is one sentry process per container, and that single process owns every GPU the container uses. If a container has 8 H100s, all 8 GPU contexts belong to one process ID — the sentry's PID.
+**Step 2: Reopen device files.** nvproxy's restore code opens `/dev/nvidia0`, `/dev/nvidiactl`, and `/dev/nvidia-uvm` on the new host, getting fresh file descriptors backed by fresh kernel objects. It re-registers for event notifications and updates memory-mapping handles to point at the new devices.
 
-NVIDIA provides an API called `cuCheckpointProcessLock` that takes a process ID and locks **every GPU context that process owns** in a single atomic operation. Because all 8 GPUs belong to one sentry PID, one call locks all of them simultaneously:
+**Step 3: Restore GPU state.** gVisor invokes the helper binary again. It calls `cuCheckpointProcessRestore` and `cuCheckpointProcessUnlock`, which tells the NVIDIA driver to load the GPU state snapshot back onto the GPU — restoring memory contents, CUDA contexts, and execution state.
 
-```
-cuCheckpointProcessLock(sentryPID)
-  → atomically locks GPU 0, GPU 1, GPU 2, ... GPU 7
-  → no window where some GPUs are locked and others aren't
-  → NCCL transfers can't deadlock because nothing is partially frozen
-```
+**Step 4: Rebuild GPU memory mappings on demand.** When the container resumes and touches GPU memory, the access triggers a page fault. gVisor's page fault handler detects that this is GPU-backed memory, maps it against the newly opened device file, and the container continues as if nothing happened.
 
-Single-GPU checkpoint is just the 1-GPU case of the same mechanism. There's no special single-GPU path — the same code handles both.
+## Multi-GPU: The Deadlock Problem
 
-## What I Built
+In multi-GPU containers, GPUs communicate directly with each other through NCCL (NVIDIA's collective communication library). GPU 0 might be mid-transfer to GPU 1 when you try to checkpoint.
 
-### Fixing the serialization crash (3 files in gVisor)
+If you freeze GPUs one at a time — lock GPU 0, then GPU 1 — you deadlock. GPU 0 is frozen mid-transfer. GPU 1 is waiting for that transfer to finish before it can be locked. Neither can proceed.
 
-**File descriptor lifecycle** — When gVisor restores a container on a new host, the old file descriptors for GPU devices are meaningless. I wrote restore logic that reopens `/dev/nvidia0`, `/dev/nvidiactl`, and `/dev/nvidia-uvm` on the new host, re-registers them with gVisor's event notification system, and updates internal references to point at the new devices. This replaces the 6 `panic("not implemented")` methods that previously existed.
+The solution relies on gVisor's architecture: one sentry process owns all GPU contexts in a container. `cuCheckpointProcessLock` takes a PID and atomically locks every GPU context that PID owns — all GPUs freeze at the same instant, no partial state, no deadlock window. One call handles 1 GPU or 8.
 
-**GPU memory handling** — GPU device memory can't be saved by gVisor's serializer because the serializer only knows how to handle regular system memory. I modified the checkpoint process to drop GPU memory regions before saving. After restore, when the application accesses GPU memory again, gVisor's page fault handler detects the missing region and transparently re-creates it by mapping against the reopened device file. The application never knows anything happened.
+## The nvproxy Routing Constraint
 
-**Missing annotations** — Two data structures in nvproxy were missing the metadata that tells gVisor's serializer how to process them. Without these annotations, the serializer crashes with nil pointer errors. I added the annotations and marked fields that contain host-specific values (raw memory addresses that won't be valid on a different machine) as non-serializable.
+The cuda-checkpoint API must be called from **inside the gVisor sandbox**, not from the host. The sentry creates GPU contexts through raw ioctl forwarding — it never loads NVIDIA's userspace library (`libcuda.so`). So from the host's perspective, the sentry PID doesn't have CUDA contexts. Calling `cuCheckpointProcessLock(sentryPID)` from the host fails with `CUDA_ERROR_NOT_INITIALIZED`.
 
-**Restore bug fix** — Found a bug where restoring a container caused an infinite hang. gVisor serializes a linked list that tracks event listeners. On restore, the list is already populated from the checkpoint data. The original code tried to re-insert entries into the list, creating a cycle — any traversal of the list would loop forever. The fix: update the callback pointer but don't re-insert the entry that's already there.
+From inside the sandbox, ioctls route through nvproxy to the real driver, and the driver resolves contexts correctly. So the helper binary runs inside the container and targets PID 1 (the container's init process).
 
-### The GPU checkpoint binary
+## Files Changed
 
-A standalone Go binary (`gvisor-gpu-ckpt`) that gVisor calls automatically during checkpoint and restore via a command-line hook (`--save-restore-exec-argv`). The binary runs **inside the container's sandbox** and targets PID 1 (the container's init process).
-
-On checkpoint: it calls `cuCheckpointProcessLock` (freeze all GPUs) then `cuCheckpointProcessCheckpoint` (snapshot GPU state).
-On restore: it calls `cuCheckpointProcessRestore` (reload GPU state) then `cuCheckpointProcessUnlock` (resume execution).
-
-It loads NVIDIA's CUDA library at runtime using `dlopen`, so there's no compile-time dependency on the NVIDIA driver. The same binary works for 1 GPU or 8 — all GPU contexts route through the single sentry process.
-
-### A non-obvious discovery
-
-The cuda-checkpoint API has to be called from **inside** the gVisor sandbox, not from the host. This wasn't documented anywhere and took significant debugging to figure out.
-
-The reason: the sentry process creates GPU contexts by forwarding raw ioctl system calls to the NVIDIA driver. It never loads NVIDIA's CUDA library (`libcuda.so`) or calls `cuInit`. From the host's perspective, the sentry has no CUDA state — so calling `cuCheckpointProcessLock(sentryPID)` from the host returns an error because the NVIDIA driver can't find any GPU contexts for that process.
-
-But from inside the sandbox, the API calls go through nvproxy, which forwards them to the real NVIDIA driver. The driver resolves the contexts correctly through this path, and all four checkpoint operations succeed.
-
-## Full Checkpoint/Restore Sequence
-
-**Saving a container:**
-1. `runsc checkpoint` is called with `--save-restore-exec-argv=gvisor-gpu-ckpt`
-2. gVisor runs `gvisor-gpu-ckpt` inside the sandbox with `MODE=save`
-3. The binary calls `cuCheckpointProcessLock(1)` — all GPU contexts freeze atomically
-4. The binary calls `cuCheckpointProcessCheckpoint(1)` — GPU state is snapshotted
-5. gVisor's serializer drops GPU memory regions that can't be saved
-6. gVisor writes the full container state to disk (kernel state, process memory, nvproxy objects)
-
-**Restoring a container:**
-1. gVisor reads the checkpoint from disk and deserializes the container state
-2. Restore callbacks reopen GPU device files on the new host and reconnect internal references
-3. GPU memory regions are left empty — they'll be re-created on demand when accessed
-4. gVisor runs `gvisor-gpu-ckpt` with `MODE=restore`
-5. The binary calls `cuCheckpointProcessRestore(1)` — GPU state is reloaded
-6. The binary calls `cuCheckpointProcessUnlock(1)` — execution resumes
-7. The container is running with full GPU state, as if nothing happened
-
-## Test Results
-
-Tested on a Lambda Labs bare-metal instance with an A10 GPU, driver 570.148.08. The test ran a CUDA program inside a gVisor container with an active CUDA context and 228 MiB of allocated GPU device memory.
-
-```
-# cuda-checkpoint API (from inside gVisor container):
-cuCheckpointProcessLock(1)       = 0   # success
-cuCheckpointProcessCheckpoint(1) = 0   # success
-cuCheckpointProcessRestore(1)    = 0   # success
-cuCheckpointProcessUnlock(1)     = 0   # success
-# Process survived with 228 MiB GPU memory intact
-
-# gVisor checkpoint: 604KB kernel state + 9.2MB process memory serialized
-# gVisor restore: deserialized in 31ms, tasks resumed
-```
-
-## Repository Structure
-
-```
-cmd/gvisor-gpu-ckpt/                   # Standalone binary (compiles independently)
-  main.go                              # Entry point, dispatches on MODE env var
-  cuda.go                              # cgo wrappers for cuCheckpointProcess* via dlopen
-
-pkg/sentry/devices/nvproxy/            # gVisor source changes (apply to gVisor tree)
-  save_restore_impl.go                 # FD lifecycle — replaces 6 panic() with real logic
-  object.go                            # Serialization annotations for nvproxy structs
-
-pkg/sentry/mm/                         # gVisor source changes (apply to gVisor tree)
-  save_restore.go                      # Drops GPU memory regions before checkpoint
-
-gvisor-nvproxy-checkpoint.patch        # All gVisor changes as a single git patch
-```
+| File | What it does |
+|------|-------------|
+| `pkg/sentry/devices/nvproxy/save_restore_impl.go` | Replaces 6 panic stubs with FD reopen, event re-registration, and memory handle updates |
+| `pkg/sentry/mm/save_restore.go` | Drops GPU-backed memory regions before serialization |
+| `pkg/sentry/devices/nvproxy/object.go` | Adds serialization annotations, marks host-specific fields as non-savable |
+| `cmd/gvisor-gpu-ckpt/main.go` | Helper binary entry point and mode dispatch |
+| `cmd/gvisor-gpu-ckpt/cuda.go` | Runtime bindings to NVIDIA's cuda-checkpoint API via `dlopen` |
 
 ## Usage
 
 ```bash
-# Build the binary (requires Go 1.21+, Linux, libcuda.so.1 at runtime)
+# Build the helper binary
 cd cmd/gvisor-gpu-ckpt && go build -o gvisor-gpu-ckpt .
 
 # Apply the gVisor patch
 cd /path/to/gvisor && git apply /path/to/gvisor-nvproxy-checkpoint.patch
 
-# Checkpoint a GPU container
-runsc checkpoint --save-restore-exec-argv=/usr/local/bin/gvisor-gpu-ckpt \
-  --image-path=/tmp/checkpoint $CONTAINER_ID
+# Checkpoint
+runsc checkpoint \
+  --save-restore-exec-argv=/usr/local/bin/gvisor-gpu-ckpt \
+  --image-path=/tmp/checkpoint \
+  $CONTAINER_ID
 
 # Restore
-runsc restore --save-restore-exec-argv=/usr/local/bin/gvisor-gpu-ckpt \
-  --image-path=/tmp/checkpoint $CONTAINER_ID
+runsc restore \
+  --save-restore-exec-argv=/usr/local/bin/gvisor-gpu-ckpt \
+  --image-path=/tmp/checkpoint \
+  $CONTAINER_ID
 ```
+
+## Test Results
+
+Tested on Lambda Labs bare-metal A10 GPU, driver 570.148.08, with a CUDA process holding 228 MiB of GPU device memory.
+
+- **Checkpoint:** 604 KB kernel state + 9.2 MB process memory serialized
+- **Restore:** State deserialized in 31ms, tasks resumed, GPU memory intact
+- **cuda-checkpoint API:** All four calls (lock, checkpoint, restore, unlock) returned success from inside the gVisor sandbox through nvproxy
 
 ## Requirements
 
 - NVIDIA driver 570+ (cuda-checkpoint API support)
 - gVisor with nvproxy enabled
 - Linux
-
-PR: [google/gvisor#13230](https://github.com/google/gvisor/pull/13230)
