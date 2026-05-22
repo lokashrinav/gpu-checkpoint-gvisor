@@ -4,8 +4,6 @@ gVisor cannot checkpoint GPU containers. Every save/restore method in nvproxy ca
 
 This project fixes both. The key contribution is **atomic multi-GPU checkpoint**: all GPUs in a container are locked, checkpointed, and restored in a single operation with no deadlock window.
 
-PR: [google/gvisor#13230](https://github.com/google/gvisor/pull/13230)
-
 ## Why Multi-GPU Checkpoint is Hard
 
 A container with 8 GPUs has active NCCL channels between them — GPU 0 is mid-transfer to GPU 1, GPU 1 is sending to GPU 2, and so on. If you lock GPU 0 first, GPU 1 is waiting for GPU 0 to finish its transfer before it can be locked. GPU 1 can't complete because GPU 0 is frozen. Deadlock.
