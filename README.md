@@ -88,26 +88,50 @@ cd cmd/gvisor-gpu-ckpt && go build -o gvisor-gpu-ckpt .
 # Apply the gVisor patch
 cd /path/to/gvisor && git apply /path/to/gvisor-nvproxy-checkpoint.patch
 
-# Checkpoint
+# Start a GPU container
+runsc --nvproxy --nvproxy-driver-version=570.133.20 \
+  run --bundle /path/to/bundle $CONTAINER_ID
+
+# Checkpoint (the --save-restore-exec-argv flag is only on checkpoint,
+# the restore side picks up the config from the saved kernel state)
 runsc checkpoint \
-  --save-restore-exec-argv=/usr/local/bin/gvisor-gpu-ckpt \
+  --save-restore-exec-argv=/bin/gvisor-gpu-ckpt \
   --image-path=/tmp/checkpoint \
   $CONTAINER_ID
 
-# Restore
-runsc restore \
-  --save-restore-exec-argv=/usr/local/bin/gvisor-gpu-ckpt \
+# Restore (no --save-restore-exec-argv needed)
+runsc --nvproxy --nvproxy-driver-version=570.133.20 \
+  restore \
   --image-path=/tmp/checkpoint \
-  $CONTAINER_ID
+  --bundle=/path/to/bundle \
+  $RESTORED_CONTAINER_ID
 ```
 
 ## Test Results
 
-Tested on Lambda Labs bare-metal A10 GPU, driver 570.148.08, with a CUDA process holding 228 MiB of GPU device memory.
+Full end-to-end cold restore verified on Lambda Labs bare-metal A10 GPU, driver 570.148.08. No Docker. Pure runsc.
 
-- Checkpoint: 604 KB kernel state + 9.2 MB process memory serialized
-- Restore: State deserialized in 31ms, tasks resumed, GPU memory intact
-- cuda-checkpoint API: All four calls (lock, checkpoint, restore, unlock) returned success from inside the gVisor sandbox through nvproxy
+Test ran a CUDA program inside a gVisor container with an active CUDA context and 228 MiB of allocated GPU device memory. The program wrote a known pattern (0xDEADBEEF) to GPU memory before checkpoint.
+
+1. `runsc run` started the container. CUDA context active at PID 1.
+2. `runsc checkpoint --save-restore-exec-argv=/bin/gvisor-gpu-ckpt` saved the container. Checkpoint files: 544 KB state + 252 MB pages (includes GPU state snapshot). Container stopped.
+3. `runsc restore` created a fresh sandbox with a fresh gofer process and loaded the checkpoint. The CUDA process resumed printing output from where it left off. nvidia-smi confirmed 454 MiB allocated to the restored sandbox.
+
+```
+# Before checkpoint:
+CUDA context active, PID=1, devptr=0x7f4f9c000000
+Wrote pattern 0xDEADBEEF to 228 MiB GPU memory
+tick=5
+
+# After restore (new sandbox, new gofer, same GPU state):
+tick=10
+tick=15
+tick=20
+
+# nvidia-smi on restored container:
+pid, process_name, used_gpu_memory [MiB]
+6444, runsc-sandbox, 454 MiB
+```
 
 ## Requirements
 
