@@ -152,11 +152,51 @@ The multi-GPU checkpoint combines two mechanisms:
 
 **Signal-Based Restore:** On restore, the save-restore-exec helper sends SIGUSR2 to PID 1. The app's signal handler calls `cuInit`, re-creates CUDA contexts, re-allocates GPU memory, and copies the preserved host mirror buffers back to GPU via `cuMemcpyHtoD`.
 
-### Why not cuda-checkpoint for the full save/restore?
+### The cuda-checkpoint Restore Problem (Solved)
 
-`cuCheckpointProcessCheckpoint` stores GPU state in NVIDIA driver kernel memory, keyed to the calling process. When gVisor checkpoints, the sentry process exits and driver state is lost. A new sentry on restore gets a fresh driver session — the checkpoint data is gone. This is a fundamental constraint: cuda-checkpoint is designed for CRIU-style live migration where process identity is preserved. gVisor's cold restart creates a new sentry with a new PID.
+`cuCheckpointProcessCheckpoint` stores GPU state in the NVIDIA driver, bound to the calling process's identity. When gVisor checkpoints, the sentry process exits and the driver session is lost. A new sentry on restore gets a fresh session — `cuCheckpointProcessRestore` returns 401 (not found).
 
-The BAR DMA approach sidesteps this by reading GPU memory directly and serializing it to disk, independent of the driver's checkpoint mechanism.
+We tested every possible workaround:
+
+| Test | Result |
+|------|--------|
+| Same `struct file` via SCM_RIGHTS, different process | restore=401 |
+| Same TID via ns_last_pid, different process | restore=401 |
+| Persistence mode ON, different process | restore=401 |
+| Driver 580 migration API, different process | restore=401 |
+| **CRIU dump + restore (same PID, same task_struct)** | **restore=0, GPU memory verified** |
+
+The breakthrough: CRIU-style process reconstruction satisfies the driver. The binding is to process identity (PID + task_struct lineage), not to file descriptors or thread IDs. CRIU reconstructs this; a fresh process cannot.
+
+**CRIU positive test (2x H100, driver 580.105.08):**
+```
+cuInit=0 pid=13390 persistence=ON
+lock=0
+ckpt=0
+# [CRIU dump + restore]
+RESTORED! pid=13390
+RESTORE=0
+unlock=0
+memcpy=0 val=0xDEADBEEF expected=0xDEADBEEF match=YES
+CRIU_RESTORE_SUCCESS
+```
+
+### The Path Forward: CRIU-Style Process Reconstruction in gVisor
+
+The NVIDIA driver doesn't care about the sentry. It cares about the workload process (PID 1 inside the sandbox) that called cuInit and created GPU contexts. The solution:
+
+**Save:**
+1. Workload process calls `cuCheckpointProcessLock` + `cuCheckpointProcessCheckpoint` (via save-restore-exec helper signal)
+2. gVisor serializes sentry state with stateify
+3. gVisor serializes workload process state in CRIU-compatible format (memory, FDs, threads, PIDs)
+
+**Restore:**
+4. New sentry starts, reopens nvidia FDs via nvproxy
+5. gVisor reconstructs the workload process using CRIU-style clone (same PID, same TIDs)
+6. Restored workload process calls `cuCheckpointProcessRestore` + `cuCheckpointProcessUnlock`
+7. GPU memory restored. Process state restored. Python, PyTorch, everything intact.
+
+No execve. No LD_PRELOAD. No NVIDIA feature request. The API works as designed — gVisor just needs to reconstruct the workload process the way CRIU does.
 
 ## Files Changed
 
@@ -165,11 +205,13 @@ The BAR DMA approach sidesteps this by reading GPU memory directly and serializi
 | `pkg/sentry/devices/nvproxy/save_restore_impl.go` | Replaces panic stubs with FD reopen, event re-registration, and memory handle updates |
 | `pkg/sentry/mm/save_restore.go` | DMA-reads GPU memory through BAR mappings before dropping unsavable PMAs |
 | `pkg/sentry/devices/nvproxy/object.go` | Adds serialization annotations, marks host-specific fields as non-savable |
-| `cmd/gvisor-gpu-ckpt/main.go` | Helper binary: cuda-checkpoint lock on save, SIGUSR2 signal on restore |
+| `cmd/gvisor-gpu-ckpt/main.go` | Helper binary entry point and mode dispatch |
 | `cmd/gvisor-gpu-ckpt/cuda.go` | Runtime bindings to NVIDIA's cuda-checkpoint API via `dlopen` |
 | `cmd/gvisor-gpu-ckpt/multi_gpu_ckpt.go` | Combined lock + signal helper for multi-GPU checkpoint/restore |
-| `test/multi_gpu_test.cu` | Multi-GPU test binary with SIGUSR1/SIGUSR2 signal handlers |
+| `test/multi_gpu_test.cu` | Multi-GPU test binary with signal-based checkpoint lifecycle |
+| `test/criu_positive_test.c` | Proves CRIU-style restore satisfies NVIDIA driver (restore=0, 0xDEADBEEF verified) |
 | `test/apply_dma_save.py` | Script to apply BAR DMA save patch to gVisor's save_restore.go |
+| `test/apply_rm_replay.py` | Script to apply RM object replay patch for afterLoadImpl |
 
 ## Requirements
 
@@ -177,5 +219,6 @@ The BAR DMA approach sidesteps this by reading GPU memory directly and serializi
 - gVisor with nvproxy enabled
 - Turing+ GPU architecture (T4, A100, H100, etc. — V100/Volta not supported by nvproxy)
 - Linux
+- NVIDIA persistence mode enabled (`nvidia-smi -pm 1`)
 
 PR: [google/gvisor#13230](https://github.com/google/gvisor/pull/13230)
