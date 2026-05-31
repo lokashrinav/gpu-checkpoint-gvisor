@@ -38,6 +38,8 @@ This is how Modal does it. Confirmed via their [GPU Memory Snapshots blog](https
 | Multi-GPU C test (2x H100) | `--leave-running` | Same | restore=0, 0xCAFE0000+0xCAFE0001 ✓ |
 | PyTorch nn.Linear (2x H100) | `--leave-running` | Same | restore=0, tensors+model ✓ |
 | **Single-GPU cold restore** | **Raw runsc** | **NEW** | **restore=0, 0xBEEF1234, 15 ticks ✓** |
+| **Multi-GPU cold restore (2x H100)** | **Raw runsc** | **NEW** | **restore=0, 0xCAFE0000+0xCAFE0001, 15 ticks ✓** |
+| **Multi-GPU + NCCL cold restore** | **Raw runsc** | **NEW** | **restore=0, patterns+NCCL allreduce, 14 ticks ✓** |
 
 **Cold restore output (sentry died, new sentry started):**
 ```
@@ -64,11 +66,27 @@ RESTORE:restore=0, RESTORE:unlock=0
 tick=16 tensors_ok=True model_ok=True ✓
 ```
 
-### Pending (capacity unavailable)
-- Multi-GPU cold restore (2x+ H100)
-- NCCL communication surviving checkpoint
-- Cross-machine (different physical machine)
-- Large models (LLMs)
+**Multi-GPU + NCCL cold restore output (2x H100, sentry died):**
+```
+NCCL initialized, allreduce across 2 GPUs
+GPU 0: 0xCAFE0000, GPU 1: 0xCAFE0001
+tick=12 patterns_ok=1 nccl_ok=1    ← before checkpoint
+SAVE:lock=0                         ← atomic multi-GPU freeze
+SAVE:ckpt=0                         ← GPU+NCCL state → host memory (666MB)
+tick=14 gpu_locked
+[sentry exits, checkpoint: 666MB]
+[NEW sentry starts, loads checkpoint]
+RESTORE:restore=0                   ← restored from host memory
+RESTORE:unlock=0
+tick=16 patterns_ok=1 nccl_ok=1     ← BOTH patterns + NCCL verified!
+... (14 consecutive ticks, all pass)
+```
+
+Key fix for NCCL: pre-configured network namespace with loopback (`ip netns add` + `ip link set lo up`). Without this, gVisor sandbox has no network interfaces and NCCL bootstrap fails. Modal configures this in their container lifecycle.
+
+### Pending
+- Cross-machine (different physical machine — same mechanism, untested)
+- Large models (tested nn.Linear, not LLMs)
 
 ## The Multi-GPU Problem
 
