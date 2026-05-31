@@ -109,34 +109,73 @@ runsc --nvproxy --nvproxy-driver-version=570.133.20 \
 
 ## Test Results
 
-Full end-to-end cold restore verified on Lambda Labs bare-metal A10 GPU, driver 570.148.08. No Docker. Pure runsc.
+### Single-GPU (A10)
 
-Test ran a CUDA program inside a gVisor container with an active CUDA context and 228 MiB of allocated GPU device memory. The program wrote a known pattern (0xDEADBEEF) to GPU memory before checkpoint.
+Cold restore verified on Lambda Labs bare-metal A10 GPU, driver 570.148.08. Pure runsc. CUDA process resumed from where it left off.
 
-1. `runsc run` started the container. CUDA context active at PID 1.
-2. `runsc checkpoint --save-restore-exec-argv=/bin/gvisor-gpu-ckpt` saved the container. Checkpoint files: 544 KB state + 252 MB pages (includes GPU state snapshot). Container stopped.
-3. `runsc restore` created a fresh sandbox with a fresh gofer process and loaded the checkpoint. The CUDA process resumed printing output from where it left off. nvidia-smi confirmed 454 MiB allocated to the restored sandbox.
+### Multi-GPU (2x H100 SXM5)
+
+Full end-to-end checkpoint/restore verified on Lambda Labs 2x H100 80GB, driver 580.105.08. Docker + gVisor.
+
+**Checkpoint (save):**
+- `cuCheckpointProcessLock` atomically froze both GPUs via the save-restore-exec helper binary
+- gVisor's `InvalidateUnsavable` DMA-read ~140MB of GPU memory across both H100s directly through the PCIe BAR mapping
+- Checkpoint files: 128 MB state + 51 MB pages serialized to disk
+- GPU memory patterns `0xCAFE0000` (GPU 0) and `0xCAFE0001` (GPU 1) verified before save
 
 ```
-# Before checkpoint:
-CUDA context active, PID=1, devptr=0x7f4f9c000000
-Wrote pattern 0xDEADBEEF to 228 MiB GPU memory
-tick=5
-
-# After restore (new sandbox, new gofer, same GPU state):
-tick=10
-tick=15
-tick=20
-
-# nvidia-smi on restored container:
-pid, process_name, used_gpu_memory [MiB]
-6444, runsc-sandbox, 454 MiB
+I0531 00:43:13.999159  GPU checkpoint: saved 2097152 bytes at vaddr 0x200600000
+I0531 00:43:14.029196  GPU checkpoint: saved 58720256 bytes at vaddr 0x200800000
+I0531 00:43:14.031350  GPU checkpoint: saved 2097152 bytes at vaddr 0x204600000
+...
+# 56 GPU memory regions saved across 2 GPUs
 ```
+
+**Restore:**
+- SIGUSR2 triggered CUDA re-initialization from host mirror buffers
+- Both GPU patterns verified intact after restore
+
+```
+RESTORE: triggered by SIGUSR2
+REINIT: GPU 0 restored from host mirror (0xCAFE0000)
+REINIT: GPU 1 restored from host mirror (0xCAFE0001)
+REINIT: done
+```
+
+## Architecture: cuda-checkpoint Lock + PCIe BAR DMA
+
+The multi-GPU checkpoint combines two mechanisms:
+
+**Atomic GPU Lock (cuda-checkpoint API):** The save-restore-exec helper binary calls `cuCheckpointProcessLock(self_pid)` before checkpoint. Through nvproxy, all sandbox processes share the sentry PID, so self-lock captures all GPU contexts across all GPUs atomically. This prevents NCCL deadlocks.
+
+**PCIe BAR DMA Save (gVisor sentry):** GPU memory allocated through nvproxy is mapped into the sentry's address space via PCIe BAR regions. Before serialization, `InvalidateUnsavable` reads GPU memory contents directly through these mappings into host buffers. The host buffers are serialized into the checkpoint file by stateify. No helper binary or app modification needed for the save.
+
+**Signal-Based Restore:** On restore, the save-restore-exec helper sends SIGUSR2 to PID 1. The app's signal handler calls `cuInit`, re-creates CUDA contexts, re-allocates GPU memory, and copies the preserved host mirror buffers back to GPU via `cuMemcpyHtoD`.
+
+### Why not cuda-checkpoint for the full save/restore?
+
+`cuCheckpointProcessCheckpoint` stores GPU state in NVIDIA driver kernel memory, keyed to the calling process. When gVisor checkpoints, the sentry process exits and driver state is lost. A new sentry on restore gets a fresh driver session — the checkpoint data is gone. This is a fundamental constraint: cuda-checkpoint is designed for CRIU-style live migration where process identity is preserved. gVisor's cold restart creates a new sentry with a new PID.
+
+The BAR DMA approach sidesteps this by reading GPU memory directly and serializing it to disk, independent of the driver's checkpoint mechanism.
+
+## Files Changed
+
+| File | What the file does |
+|------|-------------|
+| `pkg/sentry/devices/nvproxy/save_restore_impl.go` | Replaces panic stubs with FD reopen, event re-registration, and memory handle updates |
+| `pkg/sentry/mm/save_restore.go` | DMA-reads GPU memory through BAR mappings before dropping unsavable PMAs |
+| `pkg/sentry/devices/nvproxy/object.go` | Adds serialization annotations, marks host-specific fields as non-savable |
+| `cmd/gvisor-gpu-ckpt/main.go` | Helper binary: cuda-checkpoint lock on save, SIGUSR2 signal on restore |
+| `cmd/gvisor-gpu-ckpt/cuda.go` | Runtime bindings to NVIDIA's cuda-checkpoint API via `dlopen` |
+| `cmd/gvisor-gpu-ckpt/multi_gpu_ckpt.go` | Combined lock + signal helper for multi-GPU checkpoint/restore |
+| `test/multi_gpu_test.cu` | Multi-GPU test binary with SIGUSR1/SIGUSR2 signal handlers |
+| `test/apply_dma_save.py` | Script to apply BAR DMA save patch to gVisor's save_restore.go |
 
 ## Requirements
 
 - NVIDIA driver 570+ (cuda-checkpoint API support)
 - gVisor with nvproxy enabled
+- Turing+ GPU architecture (T4, A100, H100, etc. — V100/Volta not supported by nvproxy)
 - Linux
 
 PR: [google/gvisor#13230](https://github.com/google/gvisor/pull/13230)
