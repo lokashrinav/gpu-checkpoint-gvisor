@@ -9,9 +9,9 @@
 // the sentry PID fails because the sentry creates GPU contexts via raw
 // ioctls without libcuda.so initialization.
 //
-// gVisor invokes this binary with two env vars:
-//   - GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE: "save", "restore", or "resume"
-//   - GVISOR_GPU_CHECKPOINT_MODE: "direct", "signal", or "hybrid"
+// gVisor sets GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE ("save", "restore", "resume").
+// GPU checkpoint mode is passed as argv[1] via --save-restore-exec-argv,
+// or via GVISOR_GPU_CHECKPOINT_MODE env var, defaulting to "direct".
 //
 // Modes:
 //
@@ -50,9 +50,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	gpuMode := os.Getenv("GVISOR_GPU_CHECKPOINT_MODE")
-	if gpuMode == "" {
-		gpuMode = "direct"
+	// GPU mode: argv[1] takes precedence (passed via --save-restore-exec-argv),
+	// then env var, then default to direct.
+	gpuMode := "direct"
+	if len(os.Args) > 1 {
+		gpuMode = os.Args[1]
+	} else if env := os.Getenv("GVISOR_GPU_CHECKPOINT_MODE"); env != "" {
+		gpuMode = env
 	}
 
 	pid, err := getTargetPID()
