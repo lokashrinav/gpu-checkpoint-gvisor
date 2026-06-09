@@ -82,7 +82,7 @@ tick=16 patterns_ok=1 nccl_ok=1     ← BOTH patterns + NCCL verified!
 ... (14 consecutive ticks, all pass)
 ```
 
-Key fix for NCCL: pre-configured network namespace with loopback (`ip netns add` + `ip link set lo up`). Without this, gVisor sandbox has no network interfaces and NCCL bootstrap fails. Modal configures this in their container lifecycle.
+Key fix for NCCL: use `--network=none` which creates a loopback interface inside gVisor via `createDefaultLoopbackInterface()`. Set `NCCL_SOCKET_IFNAME=lo` and `NCCL_SHM_DISABLE=1`. Default sandbox networking exposes 0 interfaces without Docker, and `--network=host` blocks checkpoint.
 
 ### Pending
 - Cross-machine (different physical machine — same mechanism, untested)
@@ -152,7 +152,8 @@ This is irrelevant for the working solution since `cuCheckpointProcessRestore` r
 | File | Purpose |
 |------|---------|
 | `gvisor-nvproxy-checkpoint.patch` | Base gVisor patch: FD reopen, stateify annotations, PMA dropping |
-| `cmd/gvisor-gpu-ckpt/` | Helper binaries: cuda-checkpoint lock, signal coordination |
+| `cmd/gvisor-gpu-ckpt/main.go` | Helper binary: 3 checkpoint modes (direct, signal, hybrid) |
+| `cmd/gvisor-gpu-ckpt/cuda.go` | Runtime bindings to NVIDIA's cuda-checkpoint API via `dlopen` |
 | `test/gpu_checkpoint_test.c` | Working checkpoint test (signal-based, used for all verified tests) |
 | `test/gpu_checkpoint_test_single.c` | Single-GPU variant |
 | `test/cold_restore_test.sh` | Cold restore test script (raw runsc, no Docker) |
@@ -166,7 +167,45 @@ This is irrelevant for the working solution since `cuCheckpointProcessRestore` r
 | `test/apply_rm_replay.py` | RM object replay patch for gVisor |
 | `pkg/sentry/devices/nvproxy/` | nvproxy implementation guides for RM replay, mmap fields |
 | `pkg/sentry/mm/` | BAR DMA save implementation guide |
+| `test/gpu/multi_gpu_ckpt_test.cu` | Multi-GPU VRAM pattern verification test (no NCCL) |
+| `test/gpu/nccl_ckpt_test.cu` | Multi-GPU NCCL AllReduce + pattern verification test |
 | `RESEARCH.md` | Complete research log: all experiments, findings, architecture |
+
+## Checkpoint Modes
+
+The helper binary supports three modes via `GVISOR_GPU_CHECKPOINT_MODE` env var:
+
+| Mode | How it works | When to use |
+|------|-------------|-------------|
+| `direct` (default) | Helper calls `cuCheckpointProcess*` directly on PID 1 | Single/multi-GPU, with or without NCCL (no CUDA graphs) |
+| `signal` | Helper sends SIGUSR1/SIGUSR2 to PID 1, app handles everything | App needs full control (e.g., custom NCCL lifecycle) |
+| `hybrid` | Helper locks GPUs atomically, then signals app | Multi-GPU + NCCL + CUDA graphs (app handles NCCL suspend/resume) |
+
+Direct mode handles all GPU contexts for a PID in one atomic call. No per-GPU iteration needed. Works transparently even with active NCCL communicators.
+
+### Known Limitation
+
+CUDA graphs + NCCL + NVLink causes a segfault in `cuCheckpointProcessCheckpoint` (NVIDIA driver bug). Without CUDA graphs, direct mode works for everything.
+
+## Network Mode for NCCL
+
+NCCL needs a socket interface for bootstrap (`getifaddrs()` must find at least one). gVisor's network modes interact with checkpoint:
+
+| Network mode | NCCL works? | Checkpoint works? | Why |
+|-------------|-------------|-------------------|-----|
+| `--network=none` | Yes | Yes | Creates loopback explicitly via `createDefaultLoopbackInterface()` |
+| `--network=sandbox` (default) | No | Yes | Reads host netns — empty without Docker, so 0 interfaces |
+| `--network=host` | Yes | No | Uses kernel networking (hostinet), not serializable |
+
+For NCCL workloads, set these env vars in your OCI config:
+```json
+{
+  "env": [
+    "NCCL_SOCKET_IFNAME=lo",
+    "NCCL_SHM_DISABLE=1"
+  ]
+}
+```
 
 ## Requirements
 
@@ -176,18 +215,21 @@ This is irrelevant for the working solution since `cuCheckpointProcessRestore` r
 - NVIDIA persistence mode (`nvidia-smi -pm 1`)
 - Linux
 - For raw runsc: full NVIDIA library stack in rootfs
+- For NCCL: `--network=none`, `NCCL_SOCKET_IFNAME=lo`, `NCCL_SHM_DISABLE=1`
 
 ## Usage
 
 ```bash
-# Build helper binary
+# Build helper binary (must be built on Linux with CGO)
 cd cmd/gvisor-gpu-ckpt && go build -o gvisor-gpu-ckpt .
 
 # Apply gVisor patch
 cd /path/to/gvisor && git apply /path/to/gvisor-nvproxy-checkpoint.patch
 
 # Start container with GPU
+# Use --network=none for NCCL workloads
 runsc --nvproxy --nvproxy-driver-version=580.105.08 \
+  --network=none \
   run --bundle /path/to/bundle $CONTAINER_ID
 
 # Checkpoint (lock GPUs, save state, sentry can exit)
@@ -198,6 +240,7 @@ runsc checkpoint \
 
 # Cold restore (new sentry, GPU state from host memory)
 runsc --nvproxy --nvproxy-driver-version=580.105.08 \
+  --network=none \
   restore \
   --image-path=/tmp/checkpoint \
   --bundle=/path/to/bundle \
